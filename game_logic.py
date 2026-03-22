@@ -6,16 +6,22 @@ import copy
 import datetime
 import math
 import signal
+import sys
 import time
+import types
+from collections import deque
 from config import (
     EMP_RADIUS, EMP_STUN_DURATION, EMP_DETONATION_TIME, 
     EMP_COOLDOWN, EMP_HIT_BONUS, PLAYER_COLORS
 )
 from loader import build_full_map
 
+
 TURN_WARNING_SECONDS = 0.5
 TURN_DESTROY_SECONDS = 2.0
 MAX_TURN_WARNINGS = 5
+MEMORY_CHECK_INTERVAL_TICKS = 50
+BOT_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024
 
 
 class BotTurnTimeoutError(TimeoutError):
@@ -24,6 +30,58 @@ class BotTurnTimeoutError(TimeoutError):
 
 def _handle_bot_timeout(signum, frame):
     raise BotTurnTimeoutError()
+
+
+def _estimate_object_size(obj, seen):
+    """Approximate the deep size of Python data reachable from an object."""
+    obj_id = id(obj)
+    if obj_id in seen:
+        return 0
+    seen.add(obj_id)
+
+    if isinstance(
+        obj,
+        (
+            type,
+            types.ModuleType,
+            types.FunctionType,
+            types.BuiltinFunctionType,
+            types.MethodType,
+            types.BuiltinMethodType,
+            types.CodeType,
+        ),
+    ):
+        return 0
+
+    size = sys.getsizeof(obj)
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            size += _estimate_object_size(key, seen)
+            size += _estimate_object_size(value, seen)
+        return size
+
+    if isinstance(obj, (list, tuple, set, frozenset, deque)):
+        for item in obj:
+            size += _estimate_object_size(item, seen)
+        return size
+
+    if hasattr(obj, "__dict__"):
+        size += _estimate_object_size(vars(obj), seen)
+
+    slots = getattr(type(obj), "__slots__", ())
+    if isinstance(slots, str):
+        slots = (slots,)
+    for slot in slots:
+        if hasattr(obj, slot):
+            size += _estimate_object_size(getattr(obj, slot), seen)
+
+    return size
+
+
+def estimate_bot_state_size(bot):
+    """Approximate the persistent Python memory owned by a bot instance."""
+    return _estimate_object_size(bot, set())
 
 
 class Explosion:
@@ -99,8 +157,7 @@ class Player:
         start_time = time.perf_counter()
 
         try:
-            # Soft limit: warn after 1s. Hard limit: interrupt after 2s.
-            if hasattr(signal, "SIGALRM"):
+            if hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer"):
                 previous_handler = signal.getsignal(signal.SIGALRM)
                 signal.signal(signal.SIGALRM, _handle_bot_timeout)
                 signal.setitimer(signal.ITIMER_REAL, TURN_DESTROY_SECONDS)
@@ -111,32 +168,25 @@ class Player:
 
             if elapsed > TURN_WARNING_SECONDS:
                 self.turn_warnings += 1
-                print(
-                    f"Player {self.id} warning {self.turn_warnings}/{MAX_TURN_WARNINGS}: "
-                    f"turn took {elapsed:.3f}s"
-                )
                 if self.turn_warnings >= MAX_TURN_WARNINGS:
-                    print(
-                        f"Player {self.id} destroyed after reaching "
-                        f"{MAX_TURN_WARNINGS} slow-turn warnings."
-                    )
                     return 'TIMEOUT_DESTROY'
 
             return move
         except BotTurnTimeoutError:
-            elapsed = time.perf_counter() - start_time
-            print(
-                f"Player {self.id} destroyed: turn exceeded "
-                f"{TURN_DESTROY_SECONDS:.1f}s (elapsed {elapsed:.3f}s)."
-            )
             return 'TIMEOUT_DESTROY'
-        except Exception as e:
-            print(f"Bot {self.id} error: {e}")
+        except Exception:
             return self.direction
         finally:
             if used_timeout_handler:
                 signal.setitimer(signal.ITIMER_REAL, 0)
                 signal.signal(signal.SIGALRM, previous_handler)
+
+    def exceeds_memory_limit(self):
+        """Return True if the bot's persistent state estimate exceeds the cap."""
+        try:
+            return estimate_bot_state_size(self.bot) > BOT_MEMORY_LIMIT_BYTES
+        except Exception:
+            return False
 
 
 class Game:
@@ -154,6 +204,7 @@ class Game:
         self.bonuses_applied = False 
         self.active_emps = []
         self.explosions = [] 
+        self.death_reasons = {}
 
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.log_filename = f"game_log_{timestamp}.txt"
@@ -195,15 +246,64 @@ class Game:
             if not p.alive:
                 log_line.append("-")
             else:
-                log_line.append(moves_dict.get(p, "?"))
+                log_line.append(str(moves_dict.get(p, "?")))
         with open(self.log_filename, "a") as f:
             f.write("\t".join(log_line) + "\n")
+
+    def parse_action(self, player, action):
+        """Parse a raw bot action into EMP + movement components.
+
+        Supported formats:
+        - `N/S/E/W`: normal move
+        - `+`: boost
+        - `P`: phase
+        - `XN/XS/XE/XW`: EMP + normal move
+        - `X+`: EMP + boost
+        - `XP`: EMP + phase
+        """
+        if not isinstance(action, str):
+            return {'valid': False, 'emp': False, 'move': None}
+
+        action = action.strip().upper()
+        if not action:
+            return {'valid': False, 'emp': False, 'move': None}
+
+        use_emp = False
+        if action.startswith('X'):
+            use_emp = True
+            action = action[1:]
+
+        if action in self.dirs or action in ['+', 'P']:
+            move_action = action
+        else:
+            return {'valid': False, 'emp': False, 'move': None}
+
+        if move_action == 'P' and player.phase_charges == 0:
+            move_action = player.direction
+
+        if use_emp and player.emp_charges == 0:
+            use_emp = False
+
+        return {'valid': True, 'emp': use_emp, 'move': move_action}
+
+    @staticmethod
+    def action_points(parsed_action):
+        """Return the per-turn movement points for a parsed action."""
+        if parsed_action['move'] in ['+', 'P']:
+            return 2
+        return 1
 
     def kill_player(self, p):
         """Mark a player as dead."""
         if p.alive:
             p.alive = False
             p.death_tick = self.tick_count 
+
+    def mark_for_death(self, players_to_be_killed, player, reason):
+        """Track a pending death with a short reason for debugging."""
+        players_to_be_killed.add(player)
+        if player not in self.death_reasons:
+            self.death_reasons[player] = f"tick {self.tick_count}: {reason}"
 
     def apply_end_game_bonuses(self):
         """Apply survival bonuses at end of game."""
@@ -231,7 +331,6 @@ class Game:
             
             # Using (current_rank + 1) purely so your print statement reads naturally (Rank 1, 2, 3...)
             display_rank = current_rank + 1
-            print(f"Player {stats[i]['player'].id}: Rank {display_rank} (Tick {stats[i]['dt']}) -> +{bonus} pts")
 
     def check_game_over(self):
         """Check if the game should end (all players dead)."""
@@ -320,48 +419,45 @@ class Game:
             if moves[p] == 'TIMEOUT_DESTROY':
                 self.kill_player(p)
                 continue
-            
-            # Award points: +2 for boost/phase, +1 for normal moves
-            if moves[p] in ['+', 'P']:
-                p.score += 2
-            else:
-                p.score += 1
+
+            if self.tick_count % MEMORY_CHECK_INTERVAL_TICKS == 0 and p.exceeds_memory_limit():
+                moves[p] = 'MEMORY_DESTROY'
+                self.kill_player(p)
+                continue
 
         self.log_turn(moves)
 
         # 6. Parse Actions and Determine Execution Steps
         final_actions = {}
-        for p, action in moves.items():
+        for p, raw_action in moves.items():
             if not p.alive:
                 continue
-            if action == 'P' and p.phase_charges == 0:
-                final_actions[p] = p.direction 
-            elif action == 'X' and p.emp_charges == 0:
-                final_actions[p] = p.direction 
-            elif action not in self.dirs and action not in ['+', 'P', 'X']:
+            parsed_action = self.parse_action(p, raw_action)
+            if not parsed_action['valid']:
                 self.kill_player(p)
-                final_actions[p] = 'INVALID'
-            else:
-                final_actions[p] = action
+                final_actions[p] = {'valid': False, 'emp': False, 'move': None}
+                continue
+            final_actions[p] = parsed_action
+            p.score += self.action_points(parsed_action)
 
         # 7. Execute Moves (Hybrid Serial Execution with Delayed Head Commit)
         players_to_be_killed = set() 
         temp_move_data = {} 
         
-        for p, action in final_actions.items():
-            if not p.alive or action == 'STAND_STILL' or action == 'INVALID':
+        for p, parsed_action in final_actions.items():
+            if not p.alive or not parsed_action['valid']:
                 continue
 
             # --- Steps Generation ---
             steps = []
-            if action == 'X':
+            if parsed_action['emp']:
                 p.emp_charges -= 1
                 p.recharge_timers.append(EMP_DETONATION_TIME + EMP_COOLDOWN)
                 self.active_emps.append({
                     'owner_id': p.id, 'pos': p.pos, 'timer': EMP_DETONATION_TIME
                 })
-                continue
-            elif action == 'P':
+            action = parsed_action['move']
+            if action == 'P':
                 p.phase_charges -= 1
                 steps.append({'type': 'phase', 'dir': p.direction})
                 steps.append({'type': 'normal', 'dir': p.direction})
@@ -371,9 +467,6 @@ class Game:
             elif action in self.dirs:
                 p.direction = action
                 steps.append({'type': 'normal', 'dir': action})
-            else:
-                steps.append({'type': 'normal', 'dir': p.direction})
-                p.direction = action
 
             current_pos = p.pos
             path_to_commit = [] 
@@ -387,17 +480,17 @@ class Game:
                 
                 # 1. Collision Check (Instant Death)
                 if not self.is_valid(nx, ny):
-                    players_to_be_killed.add(p)
+                    self.mark_for_death(players_to_be_killed, p, f"out_of_bounds via {parsed_action}")
                     break
                 
                 cell = self.grid[ny][nx]
                 
                 if step['type'] != 'phase':
                     if cell == '#' or (isinstance(cell, int) and cell > 0):
-                        players_to_be_killed.add(p)
+                        self.mark_for_death(players_to_be_killed, p, f"blocked_cell {cell!r} at {(nx, ny)} via {parsed_action}")
                         break
                     if isinstance(cell, str) and cell.startswith('t'):
-                        players_to_be_killed.add(p)
+                        self.mark_for_death(players_to_be_killed, p, f"trail_collision {cell!r} at {(nx, ny)} via {parsed_action}")
                         break
                 
                 # 2. Item Collection & Clear
@@ -434,7 +527,7 @@ class Game:
             # 1. Head-to-Head Collision Check (If > 1 player lands on same spot)
             if len(players_at_cell) > 1:
                 for p in players_at_cell:
-                    players_to_be_killed.add(p)
+                    self.mark_for_death(players_to_be_killed, p, f"head_to_head at {pos}")
             
             # 2. Final Commit (If only one player landed there)
             else:

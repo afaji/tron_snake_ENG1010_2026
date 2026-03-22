@@ -123,21 +123,21 @@ def load_bot_classes(bot_folder='bots', compiled_folder='compiled_bots', use_sou
     bots = {}
     if not os.path.exists(bot_folder):
         os.makedirs(bot_folder)
-    
+
     # Track which bot names we've loaded (to avoid loading both .py and .so)
     loaded_names = set()
     
     # First, check compiled_bots folder for compiled extensions (unless use_source is True)
     if not use_source and os.path.exists(compiled_folder):
         for file in os.listdir(compiled_folder):
-            if '.cpython-' in file and (file.endswith('.so') or file.endswith('.pyd')):
+            if file.endswith('.so') or file.endswith('.pyd'):
                 name = file.split('.')[0]
                 if name in loaded_names:
                     continue
                 path = os.path.join(compiled_folder, file)
-                spec = importlib.util.spec_from_file_location(name, path)
-                module = importlib.util.module_from_spec(spec)
                 try:
+                    spec = importlib.util.spec_from_file_location(name, path)
+                    module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
                     if hasattr(module, 'Bot'):
                         bots[name] = module.Bot
@@ -167,15 +167,15 @@ def load_bot_classes(bot_folder='bots', compiled_folder='compiled_bots', use_sou
                 print(f"Failed to load {file}: {e}")
         
         # Check for compiled extensions (.so on Mac/Linux, .pyd on Windows) unless use_source is True
-        elif not use_source and '.cpython-' in file and (file.endswith('.so') or file.endswith('.pyd')):
+        elif not use_source and (file.endswith('.so') or file.endswith('.pyd')):
             # Extract bot name from e.g. "zone_keeper.cpython-311-darwin.so"
             name = file.split('.')[0]
             if name in loaded_names:
                 continue
             path = os.path.join(bot_folder, file)
-            spec = importlib.util.spec_from_file_location(name, path)
-            module = importlib.util.module_from_spec(spec)
             try:
+                spec = importlib.util.spec_from_file_location(name, path)
+                module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 if hasattr(module, 'Bot'):
                     bots[name] = module.Bot
